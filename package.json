@@ -1,0 +1,13 @@
+{
+  "name": "myclipboard",
+  "version": "1.0.0",
+  "description": "Shared clipboard for your home network",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.0.0",
+    "ws": "^8.18.0"
+  }
+}

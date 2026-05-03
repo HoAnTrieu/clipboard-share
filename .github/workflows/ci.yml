@@ -1,0 +1,262 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_PORT: 3000
+  TEST_URLS: |
+    /
+    /api/boards
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Build Docker image
+        run: docker build -t myclipboard:test .
+
+      - name: Run container
+        run: docker run -d --name app -p "${{ env.APP_PORT }}:${{ env.APP_PORT }}" myclipboard:test
+
+      - name: Capture admin credentials
+        id: admin
+        run: |
+          set -euo pipefail
+          sleep 2
+          OUTPUT=$(docker logs app 2>&1)
+          PASSWORD=$(echo "$OUTPUT" | grep 'Password:' | awk '{print $2}')
+          echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
+          echo "Admin password captured"
+
+      - name: Login and get session cookie
+        id: login
+        run: |
+          set -euo pipefail
+          COOKIE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$COOKIE_FILE" -c "$COOKIE_FILE" \
+            -X POST "http://localhost:${{ env.APP_PORT }}/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"${{ steps.admin.outputs.password }}"}')
+          [ "$HTTP_CODE" = "200" ] || { echo "Login failed: $HTTP_CODE"; exit 1; }
+          echo "cookie_file=$COOKIE_FILE" >> "$GITHUB_OUTPUT"
+          echo "Logged in as admin"
+
+      - name: Wait until all endpoints return 200
+        run: |
+          set -euo pipefail
+          base="http://localhost:${{ env.APP_PORT }}"
+          COOKIE_FILE="${{ steps.login.outputs.cookie_file }}"
+          IFS=$'\n' read -r -d '' -a URLS < <(printf '%s\0' "${{ env.TEST_URLS }}")
+          echo "Checking ${#URLS[@]} endpoint(s)..."
+
+          wait_for_200() {
+            local url="$1"
+            echo "→ Waiting for 200 from: $url"
+            for i in $(seq 1 30); do
+              if curl -fsS --max-time 2 -b "$COOKIE_FILE" "$url" > /dev/null; then
+                echo "✅ 200 from: $url"
+                return 0
+              fi
+              sleep 1
+            done
+            echo "❌ No 200 response within 30s from: $url"
+            return 1
+          }
+
+          failures=0
+          for raw in "${URLS[@]}"; do
+            url="${base}${raw}"
+            if ! wait_for_200 "$url"; then
+              failures=$((failures+1))
+            fi
+          done
+
+          if [[ $failures -gt 0 ]]; then
+            echo "Container logs:"
+            docker logs app || true
+            exit 1
+          fi
+          echo "All endpoints responded with 200"
+
+      - name: Smoke test clip creation
+        run: |
+          set -euo pipefail
+          base="http://localhost:${{ env.APP_PORT }}"
+          COOKIE_FILE="${{ steps.login.outputs.cookie_file }}"
+
+          curl -fsS -b "$COOKIE_FILE" -X POST "${base}/api/boards/default/clips" \
+            -H 'Content-Type: application/json' \
+            -d '{"type":"text","content":"ci test"}' | grep -q '"type":"text"'
+
+          curl -fsS -b "$COOKIE_FILE" "${base}/api/boards/default/clips" | grep -q '"ci test"'
+
+          # File upload
+          curl -fsS -b "$COOKIE_FILE" -X POST "${base}/api/boards/default/clips" \
+            -H 'Content-Type: application/json' \
+            -d '{"type":"file","content":"data:text/plain;base64,aGVsbG8=","originalName":"test.txt"}' | grep -q '"type":"file"'
+
+          # HTML uploads must download, not execute inline
+          HTML_CLIP=$(curl -fsS -b "$COOKIE_FILE" -X POST "${base}/api/boards/default/clips" \
+            -H 'Content-Type: application/json' \
+            -d '{"type":"file","content":"data:text/html;base64,PGgxPmhlbGxvPC9oMT4=","originalName":"test.html"}')
+          HTML_NAME=$(echo "$HTML_CLIP" | grep -o '"filename":"[^"]*"' | head -1 | cut -d'"' -f4)
+          curl -fsSI -b "$COOKIE_FILE" "${base}/api/files/${HTML_NAME}" | grep -qi 'Content-Disposition: attachment'
+          HTTP_CODE=$(curl -s -b "$COOKIE_FILE" -o /dev/null -w '%{http_code}' "${base}/api/files/${HTML_NAME}/preview")
+          [ "$HTTP_CODE" = "415" ] || { echo "Expected 415, got $HTTP_CODE"; exit 1; }
+
+          # SVG image clips are rejected
+          HTTP_CODE=$(curl -s -b "$COOKIE_FILE" -o /dev/null -w '%{http_code}' -X POST "${base}/api/boards/default/clips" \
+            -H 'Content-Type: application/json' \
+            -d '{"type":"image","content":"data:image/svg+xml;base64,PHN2Zy8+"}')
+          [ "$HTTP_CODE" = "400" ] || { echo "Expected 400, got $HTTP_CODE"; exit 1; }
+
+          # Board with expiration
+          curl -fsS -b "$COOKIE_FILE" -X POST "${base}/api/boards" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"temp","expiresIn":3600000}' | grep -q '"expiresAt"'
+
+          echo "Smoke test passed"
+
+      - name: Smoke test board rename, reorder, and lock
+        run: |
+          set -euo pipefail
+          base="http://localhost:${{ env.APP_PORT }}"
+          COOKIE_FILE="${{ steps.login.outputs.cookie_file }}"
+
+          # Create two boards
+          BOARD_A=$(curl -fsS -b "$COOKIE_FILE" -X POST "${base}/api/boards" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"Board A"}')
+          BOARD_B=$(curl -fsS -b "$COOKIE_FILE" -X POST "${base}/api/boards" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"Board B"}')
+          ID_A=$(echo "$BOARD_A" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+          ID_B=$(echo "$BOARD_B" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+          # Rename board
+          curl -fsS -b "$COOKIE_FILE" -X PUT "${base}/api/boards/${ID_A}" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"Renamed A"}' | grep -q '"Renamed A"'
+
+          # Reorder boards
+          BOARDS_JSON=$(curl -fsS -b "$COOKIE_FILE" "${base}/api/boards")
+          REORDER_PAYLOAD=$(BOARDS_JSON="$BOARDS_JSON" ID_A="$ID_A" ID_B="$ID_B" python3 - <<'PY'
+          import json, os
+
+          boards = json.loads(os.environ["BOARDS_JSON"])
+          id_a = os.environ["ID_A"]
+          id_b = os.environ["ID_B"]
+          rest = [board["id"] for board in boards if board["id"] not in {"default", id_a, id_b}]
+          print(json.dumps({"ids": ["default", id_b, id_a, *rest]}, separators=(",", ":")))
+          PY
+          )
+          curl -fsS -b "$COOKIE_FILE" -X PUT "${base}/api/boards/reorder" \
+            -H 'Content-Type: application/json' \
+            -d "${REORDER_PAYLOAD}" | grep -q '"ok"'
+
+          # Duplicate ids are rejected
+          DUPLICATE_REORDER_PAYLOAD=$(BOARDS_JSON="$BOARDS_JSON" ID_A="$ID_A" python3 - <<'PY'
+          import json, os
+
+          boards = json.loads(os.environ["BOARDS_JSON"])
+          id_a = os.environ["ID_A"]
+          rest = [board["id"] for board in boards if board["id"] not in {"default", id_a}]
+          print(json.dumps({"ids": ["default", "default", id_a, *rest[:-1]]}, separators=(",", ":")))
+          PY
+          )
+          HTTP_CODE=$(curl -s -b "$COOKIE_FILE" -o /dev/null -w '%{http_code}' -X PUT "${base}/api/boards/reorder" \
+            -H 'Content-Type: application/json' \
+            -d "${DUPLICATE_REORDER_PAYLOAD}")
+          [ "$HTTP_CODE" = "400" ] || { echo "Expected 400, got $HTTP_CODE"; exit 1; }
+
+          # Lock board
+          curl -fsS -b "$COOKIE_FILE" -X PUT "${base}/api/boards/${ID_A}" \
+            -H 'Content-Type: application/json' \
+            -d '{"locked":true}' | grep -q '"locked":true'
+
+          # Delete locked board should fail (403)
+          HTTP_CODE=$(curl -s -b "$COOKIE_FILE" -o /dev/null -w '%{http_code}' -X DELETE "${base}/api/boards/${ID_A}")
+          [ "$HTTP_CODE" = "403" ] || { echo "Expected 403, got $HTTP_CODE"; exit 1; }
+
+          # Add clip to locked board, then try to delete it (403)
+          CLIP=$(curl -fsS -b "$COOKIE_FILE" -X POST "${base}/api/boards/${ID_A}/clips" \
+            -H 'Content-Type: application/json' \
+            -d '{"type":"text","content":"locked clip"}')
+          CLIP_ID=$(echo "$CLIP" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+          HTTP_CODE=$(curl -s -b "$COOKIE_FILE" -o /dev/null -w '%{http_code}' -X DELETE "${base}/api/boards/${ID_A}/clips/${CLIP_ID}")
+          [ "$HTTP_CODE" = "403" ] || { echo "Expected 403, got $HTTP_CODE"; exit 1; }
+
+          # Unlock and delete should work
+          curl -fsS -b "$COOKIE_FILE" -X PUT "${base}/api/boards/${ID_A}" \
+            -H 'Content-Type: application/json' \
+            -d '{"locked":false}' | grep -q '"locked":false'
+          curl -fsS -b "$COOKIE_FILE" -X DELETE "${base}/api/boards/${ID_A}" | grep -q '"ok"'
+
+          echo "Board rename, reorder, and lock tests passed"
+
+      - name: Smoke test link preview
+        run: |
+          set -euo pipefail
+          base="http://localhost:${{ env.APP_PORT }}"
+          COOKIE_FILE="${{ steps.login.outputs.cookie_file }}"
+
+          # Fetch preview of a public page
+          curl -fsS -b "$COOKIE_FILE" --get "${base}/api/link-preview" \
+            --data-urlencode "url=https://example.com" | grep -q '"title"'
+
+          # Invalid URL should return 400
+          HTTP_CODE=$(curl -s -b "$COOKIE_FILE" -o /dev/null -w '%{http_code}' --get "${base}/api/link-preview" \
+            --data-urlencode "url=notaurl")
+          [ "$HTTP_CODE" = "400" ] || { echo "Expected 400, got $HTTP_CODE"; exit 1; }
+
+          # Loopback/private targets are blocked
+          HTTP_CODE=$(curl -s -b "$COOKIE_FILE" -o /dev/null -w '%{http_code}' --get "${base}/api/link-preview" \
+            --data-urlencode "url=http://127.0.0.1:${{ env.APP_PORT }}")
+          [ "$HTTP_CODE" = "400" ] || { echo "Expected 400, got $HTTP_CODE"; exit 1; }
+
+          echo "Link preview tests passed"
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f app || true
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push image
+        run: |
+          set -e
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          IMAGE="ghcr.io/${OWNER}/${REPO}"
+          SHA_TAG="sha-$(git rev-parse --short HEAD)"
+
+          docker build -t "${IMAGE}:${SHA_TAG}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${SHA_TAG}"
+          docker push "${IMAGE}:latest"
