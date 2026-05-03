@@ -99,6 +99,10 @@
             <option value="2592000000">30d</option>
           </select>
         </label>
+        <label id="modal-password-label" class="modal-label hidden">
+          <span id="modal-password-text">Password (optional)</span>
+          <input id="modal-password" type="password" autocomplete="new-password">
+        </label>
         <div class="modal-actions">
           <button id="modal-cancel" class="btn btn-secondary">Cancel</button>
           <button id="modal-create" class="btn btn-primary">Create</button>
@@ -116,6 +120,21 @@
         <div class="modal-actions">
           <button id="unlock-cancel" class="btn btn-secondary">Cancel</button>
           <button id="unlock-confirm" class="btn btn-primary" disabled>Unlock</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="board-password-modal" class="modal-overlay">
+      <div class="modal">
+        <h2 id="board-password-title">Board Password</h2>
+        <p id="board-password-desc" class="board-password-desc">This board requires a password</p>
+        <label class="modal-label">
+          <input id="board-password-input" type="password" autocomplete="off" placeholder="Enter password">
+        </label>
+        <div id="board-password-error" class="login-error hidden"></div>
+        <div class="modal-actions">
+          <button id="board-password-cancel" class="btn btn-secondary">Cancel</button>
+          <button id="board-password-submit" class="btn btn-primary">Unlock</button>
         </div>
       </div>
     </div>
@@ -145,6 +164,13 @@
 
         <!-- Settings tab -->
         <div id="admin-settings-tab" class="admin-tab-content">
+          <div class="admin-section">
+            <h3>Actions</h3>
+            <div class="admin-actions">
+              <button id="backup-db-btn" class="btn btn-secondary btn-full">Backup Database</button>
+              <button id="clear-default-btn" class="btn btn-danger btn-full">Clear Clipboard</button>
+            </div>
+          </div>
           <div class="admin-section">
             <h3 id="danger-zone-title">Danger Zone</h3>
             <div class="danger-zone">

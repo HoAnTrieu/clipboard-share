@@ -92,7 +92,7 @@ function findClipByFilename(filename) {
 }
 
 function safeDownloadName(name, fallback = 'file') {
-  return path.basename(String(name || fallback)).replace(/[\r\n"]/g, '_');
+  return path.basename(String(name || fallback)).replace(/[^\x20-\x7E]/g, '_').replace(/["']/g, '_');
 }
 
 function setDownloadHeaders(res, { contentType, disposition, filename }) {
@@ -276,11 +276,11 @@ function optionalAuth(req, res, next) {
 }
 
 function setSessionCookie(res, token, maxAge) {
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(maxAge / 1000)}; Secure=false`);
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(maxAge / 1000)}`);
 }
 
 function clearSessionCookie(res) {
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure=false`);
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
 }
 
 // --- Store ---
@@ -480,6 +480,32 @@ app.post('/api/admin/reset-database', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/admin/clear-default-board', requireAuth, requireAdmin, (req, res) => {
+  store.clips.default = [];
+  for (const dir of [IMAGES_DIR, FILES_DIR]) {
+    try {
+      const files = fs.readdirSync(dir);
+      for (const f of files) {
+        const clip = findClipByFilename(f);
+        if (!clip) {
+          try { fs.unlinkSync(path.join(dir, f)); } catch {}
+        }
+      }
+    } catch {}
+  }
+  saveStore();
+  broadcast({ type: 'board-updated', board: store.boards[0] });
+  console.log('Default board cleared by admin');
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/backup', requireAuth, requireAdmin, (req, res) => {
+  const data = JSON.stringify({ boards: store.boards, clips: store.clips, users: store.users }, null, 2);
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', 'attachment; filename="clipboard-backup.json"');
+  res.send(data);
+});
+
 // --- Boards (protected) ---
 
 app.get('/api/boards', requireAuth, (req, res) => {
@@ -492,6 +518,11 @@ app.post('/api/boards', requireAuth, (req, res) => {
   const board = { id: generateId(), name, createdAt: Date.now(), expiresAt: null };
   if (req.body.expiresIn && Number(req.body.expiresIn) > 0) {
     board.expiresAt = Date.now() + Number(req.body.expiresIn);
+  }
+  if (req.body.password) {
+    const { salt, hash } = hashPassword(req.body.password);
+    board.passwordHash = hash;
+    board.passwordSalt = salt;
   }
   store.boards.push(board);
   store.clips[board.id] = [];
@@ -533,6 +564,23 @@ app.put('/api/boards/:id', requireAuth, (req, res) => {
   if (req.body.locked !== undefined) {
     board.locked = !!req.body.locked;
   }
+  if (req.body.password !== undefined) {
+    if (!req.body.password) {
+      delete board.passwordHash;
+      delete board.passwordSalt;
+    } else {
+      const { salt, hash } = hashPassword(req.body.password);
+      board.passwordHash = hash;
+      board.passwordSalt = salt;
+    }
+  }
+  if (req.body.unlock && board.passwordHash) {
+    if (req.body.password && verifyPassword(req.body.password, board.passwordSalt, board.passwordHash)) {
+      board.unlocked = true;
+    } else {
+      return res.status(401).json({ error: 'Invalid password' });
+    }
+  }
   saveStore();
   broadcast({ type: 'board-updated', board });
   res.json(board);
@@ -566,6 +614,10 @@ app.delete('/api/boards/:id', requireAuth, (req, res) => {
 // --- Clips (protected) ---
 
 app.get('/api/boards/:id/clips', requireAuth, (req, res) => {
+  const board = store.boards.find(b => b.id === req.params.id);
+  if (board && board.passwordHash && !board.unlocked) {
+    return res.status(403).json({ error: 'Board requires password' });
+  }
   res.json(store.clips[req.params.id] || []);
 });
 
@@ -741,7 +793,7 @@ app.use((err, _req, res, next) => {
 // --- HTTP + WebSocket ---
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 const wsClients = new Map(); // ws -> session
 
 wss.on('connection', (ws, req) => {
@@ -753,8 +805,12 @@ wss.on('connection', (ws, req) => {
     return;
   }
   wsClients.set(ws, session);
-  ws.on('close', () => wsClients.delete(ws));
-  ws.on('error', () => wsClients.delete(ws));
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === 1) ws.ping();
+  }, 30000);
+  ws.on('pong', () => {});
+  ws.on('close', () => { clearInterval(pingInterval); wsClients.delete(ws); });
+  ws.on('error', () => { clearInterval(pingInterval); wsClients.delete(ws); });
 });
 
 function broadcast(data) {

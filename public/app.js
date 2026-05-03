@@ -78,6 +78,16 @@ const t = {
   resetDbBtn: 'Reset Database',
   confirmResetDb: 'Are you sure you want to reset the database? This cannot be undone.',
   dbReset: 'Database has been reset',
+  backupDb: 'Backup Database',
+  clearDefaultBoard: 'Clear Clipboard',
+  clearDefaultBoardConfirm: 'Clear all entries from the default Clipboard tab?',
+  defaultBoardCleared: 'Clipboard has been cleared',
+  tabPassword: 'Password (optional)',
+  tabPasswordSet: 'Password protected',
+  boardPassword: 'Board Password',
+  boardPasswordPrompt: 'This board requires a password',
+  enterPassword: 'Enter password',
+  unlock: 'Unlock',
 };
 
 // --- Auth state ---
@@ -111,10 +121,6 @@ async function api(method, path, body) {
         ? t.payloadTooLargeWithLimit.replace('%s', maxSize)
         : t.payloadTooLarge;
     }
-    if (res.status === 401) {
-      logout();
-      throw new Error('Session expired');
-    }
     if (!message) message = res.statusText || `HTTP ${res.status}`;
     throw new Error(message);
   }
@@ -145,7 +151,8 @@ function showApp() {
   }
   updateStaticTexts();
   connectWS();
-  loadBoards().then(() => loadClips());
+  loadBoards().catch(() => { logout(); showToast('Session error. Please login again.'); });
+  loadClips().catch(() => {});
 }
 
 function showLogin() {
@@ -155,17 +162,15 @@ function showLogin() {
 }
 
 async function login(username, password) {
+  const data = await api('POST', '/auth/login', { username, password });
+  currentUser = data.user;
+  isLoggedIn = true;
+  $('#login-error').classList.add('hidden');
   try {
-    const data = await api('POST', '/auth/login', { username, password });
-    currentUser = data.user;
-    isLoggedIn = true;
     showApp();
   } catch (e) {
-    const errorEl = $('#login-error');
-    errorEl.textContent = e.message || t.loginError;
-    errorEl.classList.remove('hidden');
-    $('#login-password').value = '';
-    throw e;
+    console.error('showApp failed:', e);
+    showToast('Login succeeded but app failed to load. Refresh the page.');
   }
 }
 
@@ -258,6 +263,8 @@ function updateStaticTexts() {
   $('#reset-db-title') && ($('#reset-db-title').textContent = t.resetDbTitle);
   $('#reset-db-desc').textContent = t.resetDbDesc;
   $('#reset-db-btn').textContent = t.resetDbBtn;
+  $('#backup-db-btn').textContent = t.backupDb;
+  $('#clear-default-btn').textContent = t.clearDefaultBoard;
 }
 
 // --- State ---
@@ -282,9 +289,16 @@ async function loadBoards() {
 }
 
 async function loadClips() {
-  clips = await api('GET', '/boards/' + currentBoardId + '/clips');
-  renderedClipIds.clear();
-  renderClips();
+  try {
+    clips = await api('GET', '/boards/' + currentBoardId + '/clips');
+    renderedClipIds.clear();
+    renderClips();
+  } catch (e) {
+    if (e.message.includes('password')) {
+      openBoardPasswordModal(currentBoardId);
+    }
+    throw e;
+  }
 }
 
 async function sendClip(type, content, originalName) {
@@ -357,9 +371,10 @@ async function deleteClip(clipId) {
   }
 }
 
-async function createBoard(name, expiresIn) {
+async function createBoard(name, expiresIn, password) {
   const body = { name };
   if (expiresIn) body.expiresIn = Number(expiresIn);
+  if (password) body.password = password;
   await api('POST', '/boards', body);
 }
 
@@ -445,11 +460,19 @@ function renderLinkPreviews(content, text) {
 
 // --- WebSocket ---
 
+let wsReconnectDelay = 1000;
+const WS_MAX_RECONNECT_DELAY = 30000;
+
 function connectWS() {
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host);
 
   ws.onopen = () => {
+    wsReconnectDelay = 1000;
     $('#status').className = 'status online';
     $('#status').title = t.connected;
   };
@@ -546,7 +569,10 @@ function connectWS() {
   ws.onclose = () => {
     $('#status').className = 'status offline';
     $('#status').title = t.reconnecting;
-    setTimeout(connectWS, 2000);
+    setTimeout(() => {
+      wsReconnectDelay = Math.min(wsReconnectDelay * 1.5, WS_MAX_RECONNECT_DELAY);
+      connectWS();
+    }, wsReconnectDelay);
   };
 
   ws.onerror = () => ws.close();
@@ -603,6 +629,14 @@ function renderTabs() {
       badge.className = 'tab-badge';
       badge.textContent = unreadCounts[board.id];
       btn.appendChild(badge);
+    }
+
+    if (board.passwordHash && !board.unlocked) {
+      const lock = document.createElement('span');
+      lock.className = 'lock-board';
+      lock.textContent = '\uD83D\uDD12';
+      lock.title = t.tabPasswordSet;
+      btn.appendChild(lock);
     }
 
     if (board.expiresAt) {
@@ -1104,9 +1138,17 @@ function showToast(msg) {
 function openNewBoardModal() {
   $('#modal-name').value = '';
   $('#modal-expires').value = '';
+  $('#modal-password').value = '';
+  $('#modal-password-label').classList.add('hidden');
   $('#new-board-modal').classList.add('visible');
   setTimeout(() => $('#modal-name').focus(), 50);
 }
+
+$('#modal-expires').addEventListener('change', () => {
+  const isNever = $('#modal-expires').value === '';
+  $('#modal-password-label').classList.toggle('hidden', !isNever);
+  if (!isNever) $('#modal-password').value = '';
+});
 
 function closeNewBoardModal() {
   $('#new-board-modal').classList.remove('visible');
@@ -1122,7 +1164,8 @@ $('#modal-create').addEventListener('click', () => {
   const name = $('#modal-name').value.trim();
   if (!name) return;
   const expiresIn = $('#modal-expires').value;
-  createBoard(name, expiresIn || null);
+  const password = $('#modal-password').value;
+  createBoard(name, expiresIn || null, password || null);
   closeNewBoardModal();
 });
 
@@ -1132,6 +1175,56 @@ $('#modal-name').addEventListener('keydown', (e) => {
     $('#modal-create').click();
   }
   if (e.key === 'Escape') closeNewBoardModal();
+});
+
+// --- Board password modal ---
+
+let boardPasswordBoardId = null;
+
+function openBoardPasswordModal(boardId) {
+  boardPasswordBoardId = boardId;
+  $('#board-password-title').textContent = t.boardPassword;
+  $('#board-password-desc').textContent = t.boardPasswordPrompt;
+  $('#board-password-input').value = '';
+  $('#board-password-error').classList.add('hidden');
+  $('#board-password-modal').classList.add('visible');
+  setTimeout(() => $('#board-password-input').focus(), 50);
+}
+
+function closeBoardPasswordModal() {
+  $('#board-password-modal').classList.remove('visible');
+  boardPasswordBoardId = null;
+}
+
+$('#board-password-cancel').addEventListener('click', closeBoardPasswordModal);
+
+$('#board-password-modal').addEventListener('click', (e) => {
+  if (e.target === $('#board-password-modal')) closeBoardPasswordModal();
+});
+
+$('#board-password-submit').addEventListener('click', async () => {
+  if (!boardPasswordBoardId) return;
+  const password = $('#board-password-input').value;
+  if (!password) return;
+  $('#board-password-error').classList.add('hidden');
+  try {
+    await api('PUT', '/boards/' + boardPasswordBoardId, { unlock: true, password });
+    closeBoardPasswordModal();
+    loadClips().catch(() => {});
+  } catch (e) {
+    $('#board-password-error').textContent = e.message || 'Invalid password';
+    $('#board-password-error').classList.remove('hidden');
+    $('#board-password-input').value = '';
+    $('#board-password-input').focus();
+  }
+});
+
+$('#board-password-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    $('#board-password-submit').click();
+  }
+  if (e.key === 'Escape') closeBoardPasswordModal();
 });
 
 // --- Unlock modal ---
@@ -1329,6 +1422,24 @@ $('#user-modal-username').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeUserModal();
 });
 $('#reset-db-btn').addEventListener('click', resetDatabase);
+
+$('#backup-db-btn').addEventListener('click', () => {
+  const a = document.createElement('a');
+  a.href = '/api/admin/backup';
+  a.download = 'clipboard-backup.json';
+  a.click();
+});
+
+$('#clear-default-btn').addEventListener('click', async () => {
+  if (!confirm(t.clearDefaultBoardConfirm)) return;
+  try {
+    await api('POST', '/admin/clear-default-board');
+    showToast(t.defaultBoardCleared);
+    loadClips();
+  } catch (e) {
+    showToast(e.message);
+  }
+});
 
 // --- Login form ---
 

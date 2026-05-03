@@ -1189,3 +1189,20 @@ main {
 .hidden {
   display: none !important;
 }
+
+.admin-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.btn-full {
+  width: 100%;
+}
+
+.board-password-desc {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}

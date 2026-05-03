@@ -25,6 +25,9 @@ A remix of [Wklejka](https://github.com/krbob/wklejka) by [krbob](https://github
 - **Authentication** – login screen with session-based cookie auth (7-day expiry). No access without credentials.
 - **User management (Admin panel)** – admins can add, edit, and delete users with role assignment (user or admin).
 - **Database reset** – admin can wipe all boards, clips, and uploaded files with a single click.
+- **Database backup** – admin can export the entire database as a JSON file.
+- **Clear default clipboard** – admin can clear all entries from the default Clipboard tab without deleting other boards.
+- **Password-protected tabs** – when creating a tab with "Never" expiry, admins can optionally set a password.
 - **1 GB file upload limit** – increased from the original 100 MB.
 - **English-only UI** – removed Polish localization for a single-language experience.
 

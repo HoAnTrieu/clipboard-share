@@ -1,0 +1,82 @@
+name: clipboard-share
+services:
+  web:
+    cpu_shares: 90
+    command: []
+    container_name: clipboard-share
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      - PORT=3000
+      - DATA_DIR=/app/data
+      - MAX_CLIP_BINARY_BYTES=1073741824
+    hostname: clipboard-share
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:3000/', (r) => r.statusCode === 200 || r.statusCode === 302 ? process.exit(0) : process.exit(1))"
+      timeout: 5s
+      interval: 30s
+      retries: 5
+      start_period: 15s
+    image: hoantrieu/clipboard-share:latest
+    labels:
+      icon: https://cdn-icons-png.flaticon.com/512/2863/2863547.png
+    ports:
+      - mode: ingress
+        target: 3000
+        published: "3000"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /DATA/AppData/clipboard-share/data
+        target: /app/data
+        bind:
+          create_host_path: true
+    devices: []
+    cap_add: []
+    network_mode: bridge
+    privileged: false
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  author: hoantrieu
+  category: BigBearCasaOS
+  description:
+    en_us: Lightweight, browser-based shared clipboard with real-time WebSocket sync, authentication, and admin management.
+  developer: hoantrieu
+  hostname: ""
+  icon: https://cdn-icons-png.flaticon.com/512/2863/2863547.png
+  index: /
+  is_uncontrolled: false
+  main: web
+  port_map: "3000"
+  scheme: http
+  store_app_id: clipboard-share
+  tagline:
+    en_us: Shared clipboard with auth and real-time sync
+  thumbnail: ""
+  tips:
+    before_install:
+      en_us: |
+        After installation, check the container logs for the default admin password:
+        docker logs clipboard-share 2>&1 | grep -A5 "DEFAULT ADMIN ACCOUNT"
+
+        Default login:
+        - Admin: admin / <password-from-logs>
+    custom: |+
+      After installation, check the container logs for the default admin password:
+      "docker logs clipboard-share 2>&1 | grep -A5 'DEFAULT ADMIN ACCOUNT'"
+
+      Default login:
+      - Admin: admin / <password-from-logs>
+
+  title:
+    custom: ""
+    en_us: Clipboard Share
